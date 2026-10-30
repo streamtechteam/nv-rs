@@ -6,10 +6,10 @@
 //!
 //! The Steam executable is packed, but only its `.text` is encrypted: its
 //! `.rdata`, `.data`, `.tls` and `CONST` are byte-identical to the unpacked
-//! file's (checked 2026-10-09). Each section is checked against the FNV-1a
-//! 64-bit hash of version 1.4.0.525's section before it is mapped; a
-//! different build is refused, because every address in the translations
-//! belongs to 1.4.0.525.
+//! file's (checked 2026-10-09). The build is not checked: any executable
+//! that has these sections is mapped, at the addresses and sizes in its own
+//! section table. The translated code's absolute addresses still belong to
+//! 1.4.0.525, so a different build may not resolve all of them.
 
 use crate::mem::Mem;
 use std::path::Path;
@@ -17,16 +17,9 @@ use std::path::Path;
 /// Image base of FalloutNV.exe.
 pub const IMAGE_BASE: u32 = 0x0040_0000;
 
-/// (name, virtual address, virtual size, FNV-1a 64 of the raw bytes) of
-/// the sections that are mapped, FalloutNV.exe 1.4.0.525.
-pub const SECTIONS: [(&str, u32, u32, u64); 4] = [
-    (".rdata", 0x00FD_F000, RDATA_VSIZE, RDATA_HASH),
-    (".data", 0x0118_3000, DATA_VSIZE, DATA_HASH),
-    (".tls", 0x0127_2000, TLS_VSIZE, TLS_HASH),
-    ("CONST", 0x0127_3000, CONST_VSIZE, CONST_HASH),
-];
-
-include!("exe_hashes.rs");
+/// Names of the sections that are mapped. Their addresses and sizes come
+/// from the executable's section table.
+pub const SECTIONS: [&str; 4] = [".rdata", ".data", ".tls", "CONST"];
 
 pub fn fnv1a64(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -166,51 +159,37 @@ pub fn installed_exe(data_dir: &Path) -> std::path::PathBuf {
     game_dir.join("FalloutNV.exe")
 }
 
-/// The data sections of `file` (the bytes of `exe`) after checking that it
-/// is FalloutNV.exe 1.4.0.525, the build every translated address belongs
-/// to. Any other build is refused with a message that says so.
+/// The data sections of `file` (the bytes of `exe`). The build is not
+/// checked: any PE that has the required sections is accepted, and their
+/// addresses and sizes are taken from its own section table.
 pub fn checked_sections(exe: &Path, file: &[u8]) -> Result<Vec<Section>, String> {
-    let refuse = |what: String| {
-        format!(
-            "{}: {what}. nv-rs needs FalloutNV.exe version 1.4.0.525 (the build it \
-             was traced from); other builds are not supported yet.",
-            exe.display()
-        )
-    };
-    let secs = sections(file).map_err(refuse)?;
-    for (name, va, _, hash) in SECTIONS {
-        let s = secs
-            .iter()
-            .find(|s| s.name == name)
-            .ok_or_else(|| refuse(format!("no {name} section")))?;
-        if s.va != va || fnv1a64(&s.raw) != hash {
-            return Err(refuse(format!(
-                "section {name} is not 1.4.0.525's (address {:08x}, hash {:016x})",
-                s.va,
-                fnv1a64(&s.raw)
-            )));
+    let secs = sections(file).map_err(|e| format!("{}: {e}", exe.display()))?;
+    for name in SECTIONS {
+        if !secs.iter().any(|s| s.name == name) {
+            return Err(format!("{}: no {name} section", exe.display()));
         }
     }
     Ok(secs)
 }
 
-/// Reads `exe` and checks it ([`checked_sections`]) without mapping it:
-/// the startup check of an installation's executable.
+/// Reads `exe` and checks that it has the required sections
+/// ([`checked_sections`]) without mapping it: the startup check of an
+/// installation's executable.
 pub fn verify(exe: &Path) -> Result<(), String> {
     let file = std::fs::read(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
     checked_sections(exe, &file).map(|_| ())
 }
 
 /// Maps `.rdata`, `.data`, `.tls` and `CONST` of `exe` (the installed
-/// FalloutNV.exe, packed or unpacked) after checking each against 1.4.0.525.
+/// FalloutNV.exe, packed or unpacked) at the addresses in its section table.
 pub fn map_data_sections(mem: &mut Mem, exe: &Path) -> Result<(), String> {
     let file = std::fs::read(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
     let secs = checked_sections(exe, &file)?;
-    for (name, va, vsize, _) in SECTIONS {
+    for name in SECTIONS {
         let s = secs.iter().find(|s| s.name == name).expect("checked above");
-        mem.map(va, vsize.max(s.raw.len() as u32));
-        let n = s.raw.len().min(vsize as usize);
-        mem.write(va, &s.raw[..n]);
+        mem.map(s.va, s.vsize.max(s.raw.len() as u32));
+        let n = s.raw.len().min(s.vsize as usize);
+        mem.write(s.va, &s.raw[..n]);
     }
     Ok(())
 }
@@ -220,15 +199,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn other_files_are_refused_with_the_supported_build_named() {
-        let err = checked_sections(Path::new("x.exe"), b"MZ but not a PE file").unwrap_err();
+    fn other_files_are_refused_with_the_path_named() {
+        let mut bogus = vec![0u8; 0x40];
+        bogus[0..2].copy_from_slice(b"MZ");
+        let err = checked_sections(Path::new("x.exe"), &bogus).unwrap_err();
         assert!(err.starts_with("x.exe: "), "{err}");
-        assert!(err.contains("version 1.4.0.525"), "{err}");
+        assert!(err.contains("not a PE file"), "{err}");
         let data = Path::new("C:/Games/Fallout New Vegas/Data");
         assert_eq!(
             installed_exe(data),
             Path::new("C:/Games/Fallout New Vegas/FalloutNV.exe")
         );
+    }
+
+    /// A PE whose sections are neither at 1.4.0.525's addresses nor have its
+    /// bytes is still accepted: only the section names are required.
+    #[test]
+    fn other_builds_are_not_refused() {
+        let file = fake_pe();
+        let secs = checked_sections(Path::new("other.exe"), &file).unwrap();
+        for name in SECTIONS {
+            let s = secs.iter().find(|s| s.name == name).unwrap();
+            assert_eq!(s.raw, [1, 2, 3, 4]);
+        }
+    }
+
+    /// A minimal PE with the four required sections, each at an address and
+    /// with bytes that differ from 1.4.0.525's.
+    fn fake_pe() -> Vec<u8> {
+        let pe = 0x40usize;
+        let opt = 0x70usize;
+        let table = pe + 24 + opt;
+        let raw_at = table + 40 * SECTIONS.len();
+        let mut f = vec![0u8; raw_at + 4 * SECTIONS.len()];
+        f[0..2].copy_from_slice(b"MZ");
+        f[0x3c..0x40].copy_from_slice(&(pe as u32).to_le_bytes());
+        f[pe..pe + 4].copy_from_slice(b"PE\0\0");
+        f[pe + 6..pe + 8].copy_from_slice(&(SECTIONS.len() as u16).to_le_bytes());
+        f[pe + 20..pe + 22].copy_from_slice(&(opt as u16).to_le_bytes());
+        f[pe + 24 + 28..pe + 24 + 32].copy_from_slice(&IMAGE_BASE.to_le_bytes());
+        for (i, name) in SECTIONS.iter().enumerate() {
+            let s = table + 40 * i;
+            f[s..s + name.len()].copy_from_slice(name.as_bytes());
+            f[s + 8..s + 12].copy_from_slice(&4u32.to_le_bytes());
+            f[s + 12..s + 16].copy_from_slice(&(0x1000 * (i as u32 + 1)).to_le_bytes());
+            f[s + 16..s + 20].copy_from_slice(&4u32.to_le_bytes());
+            f[s + 20..s + 24].copy_from_slice(&((raw_at + 4 * i) as u32).to_le_bytes());
+            f[raw_at + 4 * i..raw_at + 4 * i + 4].copy_from_slice(&[1, 2, 3, 4]);
+        }
+        f
     }
 
     #[test]
