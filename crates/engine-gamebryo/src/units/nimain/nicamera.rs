@@ -1377,13 +1377,16 @@ fn stream_write(e: &mut Engine, stream: Ptr, source: u32, size: u32) {
     stream_transfer(e, writer, IO_SLOT_WRITE, source, size);
 }
 
+/// The transfer function is a word of the binary stream object itself (00a71482: `MOV EAX,
+/// [EBX+0x8]`, then `CALL EAX` with the object first, cdecl: `ADD ESP,0x14`), not a virtual slot:
+/// a virtual call at +8 reached the stream's Seek (00aa1a90) with five words.
 fn stream_transfer(e: &mut Engine, object: u32, slot: u32, buffer: u32, size: u32) {
+    let transfer = e.mem.u32(object + slot);
     let transferred = e.with_stack(4, |e, size_variable| {
         e.mem.set_u32(size_variable.addr(), size);
-        e.vcall(
-            object,
-            slot,
-            &args![buffer, size, size_variable.addr(), 1u32],
+        e.call(
+            transfer,
+            &args![object, buffer, size, size_variable.addr(), 1u32],
         )
         .u32()
     });
@@ -3241,14 +3244,12 @@ mod tests {
 
     // ---- LoadBinary and SaveBinary
 
-    const READER_TABLE: u32 = 0x0300_3000;
     const READ_DOUBLE: u32 = 0x0070_0500;
-    const WRITER_TABLE: u32 = 0x0300_3100;
     const WRITE_DOUBLE: u32 = 0x0070_0510;
     const STREAM_TABLE: u32 = 0x0300_3200;
     const SAVE_LINK_DOUBLE: u32 = 0x0070_0520;
 
-    /// A stream with a reader whose virtual read writes the number of the
+    /// A stream with a reader whose read function writes the number of the
     /// call as a float (4 bytes), `0x1234` (2 bytes) or 1 (1 byte).
     fn load_stream(e: &mut Engine, version: u32) -> (Ptr, u32) {
         let counter = Rc::new(Cell::new(0u32));
@@ -3265,9 +3266,9 @@ mod tests {
             }
             eax(a[2])
         });
-        vtable(e, READER_TABLE, &[(IO_SLOT_READ, READ_DOUBLE)]);
-        let reader = e.mem.alloc(8);
-        e.mem.set_u32(reader, READER_TABLE);
+        // The read function is the binary stream object's own word at +8 (00a71482).
+        let reader = e.mem.alloc(0x10);
+        e.mem.set_u32(reader + IO_SLOT_READ, READ_DOUBLE);
         e.register(AV_OBJECT_LOAD_BINARY, |_, _| Ret::default());
         e.register(STREAM_READ_LINK_ID, |_, _| Ret::default());
         e.register(STREAM_READ_MULTIPLE_LINK_IDS, |_, _| Ret::default());
@@ -3370,14 +3371,14 @@ mod tests {
             recorded.borrow_mut().push((0xffff, vec![]));
             Ret::default()
         });
-        vtable(e, WRITER_TABLE, &[(IO_SLOT_WRITE, WRITE_DOUBLE)]);
+        // The write function is the binary stream object's own word at +0xc (00a716ef).
         vtable(
             e,
             STREAM_TABLE,
             &[(STREAM_SLOT_SAVE_LINK_ID, SAVE_LINK_DOUBLE)],
         );
-        let writer = e.mem.alloc(8);
-        e.mem.set_u32(writer, WRITER_TABLE);
+        let writer = e.mem.alloc(0x10);
+        e.mem.set_u32(writer + IO_SLOT_WRITE, WRITE_DOUBLE);
         e.register(AV_OBJECT_SAVE_BINARY, |_, _| Ret::default());
         let stream = Ptr::new(e.mem.alloc(0x300));
         e.mem.set_u32(stream.addr(), STREAM_TABLE);
