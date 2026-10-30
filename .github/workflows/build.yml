@@ -1,0 +1,295 @@
+# Build: compile the viewer for the platforms it supports and upload the
+# artifacts. Triggered by hand (workflow_dispatch) and by version tags (v*).
+#
+# Platforms:
+#   windows-x64  the packaged playtest zip, staged like
+#                scripts/package-playtest.ps1 (app/nv-viewer.exe, the Play
+#                launchers, notices, licenses). The script's own gates (a
+#                committed, clean checkout; a refreshed dependency-notice
+#                lock) are not re-checked here; refresh
+#                distribution/DEPENDENCY-LOCK.sha256 before an official
+#                release.
+#   linux-x64    a tarball with the viewer and its runtime-package notes.
+#                Built on ubuntu-latest, so it needs a similarly new glibc.
+#   macos        arm64, x64 (cross-compiled) and a universal2 binary via
+#                lipo, as three tarballs.
+#
+# A tag push (v1.2.3) also opens a draft release with every artifact and
+# its SHA256 attached; dispatch runs only produce build artifacts.
+
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version label (defaults to the short commit hash)'
+        required: false
+        default: ''
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  version:
+    name: resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve the package version
+        id: resolve
+        env:
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          INPUT: ${{ inputs.version }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -n "$TAG" ]; then
+            version="${TAG#v}"
+          else
+            version="${INPUT:-${SHA::7}}"
+          fi
+          case "$version" in
+            [a-zA-Z0-9]*) ;;
+            *) echo "Version '$version' must start with a letter or digit." >&2; exit 1 ;;
+          esac
+          if ! printf '%s' "$version" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9._-]*$'; then
+            echo "Version '$version' may only hold letters, digits, dots, dashes and underscores." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  windows-x64:
+    name: build (windows-x64)
+    runs-on: windows-latest
+    needs: version
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: viewer -> target
+          shared-key: windows-x64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the viewer (release)
+        working-directory: viewer
+        run: |
+          cargo build --release --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Stage the Windows playtest package
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:GITHUB_WORKSPACE
+          $exe = Join-Path $root 'viewer/target/release/nv-viewer.exe'
+          if (!(Test-Path -LiteralPath $exe)) { throw 'The release build produced no nv-viewer.exe.' }
+          $name = "nv-rs-$($env:VERSION)-windows-x64"
+          $stage = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Path (Join-Path $stage 'app') -Force | Out-Null
+          Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'app/nv-viewer.exe')
+          foreach ($file in @('Play.cmd', 'Play.ps1', 'README.txt', 'THIRD-PARTY-NOTICES.txt')) {
+            Copy-Item -LiteralPath (Join-Path $root "distribution/$file") -Destination $stage
+          }
+          Copy-Item -LiteralPath (Join-Path $root 'distribution/licenses') -Destination $stage -Recurse
+          foreach ($file in @('LICENSE', 'LEGAL.md')) {
+            Copy-Item -LiteralPath (Join-Path $root $file) -Destination $stage
+          }
+          $sha = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+          @("nv-rs experimental playtest $($env:VERSION)", "Source commit: $($env:SHA)", "Executable SHA256: $sha", "Platform: Windows x64", "Source: https://github.com/slaterain/nv-rs/tree/$($env:SHA)") | Set-Content -LiteralPath (Join-Path $stage 'BUILD.txt') -Encoding utf8
+          $zip = Join-Path $env:RUNNER_TEMP "$name.zip"
+          Compress-Archive -LiteralPath $stage -DestinationPath $zip -CompressionLevel Optimal
+          $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$zipHash  $name.zip" | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP "$name.zip.sha256") -Encoding ascii
+      - name: Upload the Windows package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nv-rs-${{ needs.version.outputs.version }}-windows-x64
+          path: |
+            ${{ runner.temp }}/nv-rs-${{ needs.version.outputs.version }}-windows-x64.zip
+            ${{ runner.temp }}/nv-rs-${{ needs.version.outputs.version }}-windows-x64.zip.sha256
+          retention-days: 30
+          if-no-files-found: error
+
+  linux-x64:
+    name: build (linux-x64)
+    runs-on: ubuntu-latest
+    needs: version
+    timeout-minutes: 180
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install native viewer dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev pkg-config
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: viewer -> target
+          shared-key: linux-x64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the viewer (release)
+        working-directory: viewer
+        run: |
+          cargo build --release --locked
+      - name: Stage the Linux tarball
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          name="nv-rs-$VERSION-linux-x64"
+          exe="$GITHUB_WORKSPACE/viewer/target/release/nv-viewer"
+          test -x "$exe"
+          mkdir -p "$name"
+          cp "$exe" "$name/nv-viewer"
+          cp "$GITHUB_WORKSPACE/LICENSE" "$GITHUB_WORKSPACE/LEGAL.md" "$name/"
+          exeHash=$(sha256sum "$name/nv-viewer" | cut -d ' ' -f 1)
+          {
+            echo "nv-rs Linux build $VERSION"
+            echo "Source commit: $SHA"
+            echo "Executable SHA256: $exeHash"
+            echo "Platform: Linux x64"
+            echo "Source: https://github.com/slaterain/nv-rs/tree/$SHA"
+          } > "$name/BUILD.txt"
+          cat > "$name/README-LINUX.txt" <<'EOF'
+          nv-rs Linux build (runs from source; Windows remains the packaged
+          playtest platform).
+
+          Run:
+            ./nv-viewer "<path to Fallout New Vegas\Data>" GSDocMitchellHouse
+
+          Runtime packages (Debian/Ubuntu): libasound2, libudev1,
+          libwayland-client0, libxkbcommon0, and a Vulkan loader with a
+          working GPU driver (Fedora: alsa-lib, libudev, wayland,
+          libxkbcommon, vulkan loader).
+
+          From a Wayland session winit prefers Wayland; unsetting DISPLAY
+          forces the native Wayland path and WGPU_BACKEND=vulkan selects
+          Vulkan rendering.
+          EOF
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+      - name: Upload the Linux tarball
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nv-rs-${{ needs.version.outputs.version }}-linux-x64
+          path: |
+            ${{ runner.temp }}/nv-rs-${{ needs.version.outputs.version }}-linux-x64.tar.gz
+            ${{ runner.temp }}/nv-rs-${{ needs.version.outputs.version }}-linux-x64.tar.gz.sha256
+          retention-days: 30
+          if-no-files-found: error
+
+  macos:
+    name: build (macos)
+    runs-on: macos-latest
+    needs: version
+    timeout-minutes: 180
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install stable Rust and the x86_64 target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: viewer -> target
+          shared-key: macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the viewer for both architectures
+        working-directory: viewer
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - name: Stage the macOS tarballs (arm64, x64, universal2)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          arm64="$GITHUB_WORKSPACE/viewer/target/aarch64-apple-darwin/release/nv-viewer"
+          x64="$GITHUB_WORKSPACE/viewer/target/x86_64-apple-darwin/release/nv-viewer"
+          test -x "$arm64" && test -x "$x64"
+          universal="$RUNNER_TEMP/nv-viewer-universal2"
+          lipo -create "$arm64" "$x64" -output "$universal"
+          for variant in arm64 x64 universal2; do
+            name="nv-rs-$VERSION-macos-$variant"
+            mkdir -p "$name"
+            case "$variant" in
+              arm64)      cp "$arm64"     "$name/nv-viewer" ;;
+              x64)        cp "$x64"       "$name/nv-viewer" ;;
+              universal2) cp "$universal" "$name/nv-viewer" ;;
+            esac
+            cp "$GITHUB_WORKSPACE/LICENSE" "$GITHUB_WORKSPACE/LEGAL.md" "$name/"
+            exeHash=$(shasum -a 256 "$name/nv-viewer" | cut -d ' ' -f 1)
+            {
+              echo "nv-rs macOS build $VERSION"
+              echo "Source commit: $SHA"
+              echo "Executable SHA256: $exeHash"
+              echo "Platform: macOS $variant"
+              echo "Source: https://github.com/slaterain/nv-rs/tree/$SHA"
+            } > "$name/BUILD.txt"
+            cat > "$name/README-MACOS.txt" <<'EOF'
+          nv-rs macOS build (native viewer, Metal).
+
+          Run:
+            ./nv-viewer "/path/to/Fallout New Vegas/Data" GSDocMitchellHouse
+
+          Pass the Data folder from your own PC installation. The universal2
+          build runs natively on both Apple silicon and Intel Macs.
+          EOF
+            tar -czf "$name.tar.gz" "$name"
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          done
+      - name: Upload the macOS tarballs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nv-rs-${{ needs.version.outputs.version }}-macos
+          path: |
+            ${{ runner.temp }}/nv-rs-${{ needs.version.outputs.version }}-macos-*.tar.gz
+            ${{ runner.temp }}/nv-rs-${{ needs.version.outputs.version }}-macos-*.tar.gz.sha256
+          retention-days: 30
+          if-no-files-found: error
+
+  release:
+    name: release (draft)
+    runs-on: ubuntu-latest
+    needs: [windows-x64, linux-x64, macos]
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Attach every artifact to a draft release
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --generate-notes --title "nv-rs ${TAG#v}"
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --dir dist
+          find dist -type f -print0 | xargs -0 gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber
