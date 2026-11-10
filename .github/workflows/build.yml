@@ -1,0 +1,61 @@
+# Build: compile nv-viewer for Linux and Windows and upload the binaries.
+# The platform-neutral checks (fmt, tests, clippy) live in ci.yml; this
+# workflow proves the viewer and the engine port build on both platforms.
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            binary: target/release/nv-viewer
+          - name: windows-x64
+            os: windows-latest
+            binary: target/release/nv-viewer.exe
+    env:
+      # CI builds once from a cache; incremental state and debug info only cost time.
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_RELEASE_DEBUG: 0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev pkg-config
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: '. -> target'
+          shared-key: build-${{ matrix.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build nv-viewer (release)
+        run: cargo build --locked --release -p nv-viewer
+      - name: Upload the binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nv-viewer-${{ matrix.name }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 30
