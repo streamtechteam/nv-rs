@@ -45,8 +45,9 @@ each function belongs to.
   (`Mem::hand_back_deferred`). The diagnostics (write watch, block check,
   touch census) run stepped only.
 - **The exe's data**: `Engine::with_exe(path)` maps `.rdata`, `.data`,
-  `.tls` and `CONST` of the player's installed FalloutNV.exe (checked
-  against 1.4.0.525) at their addresses. Constants, strings, vtables and
+  `.tls` and `CONST` of the player's installed FalloutNV.exe at the
+  addresses in its section table (the build is not checked). Constants,
+  strings, vtables and
   initial globals are therefore the game's own; nothing from the exe is in
   the repository. Tests run without the exe and set what they need.
   The code section (`.text`) is not mapped (the Steam exe encrypts it): the
@@ -773,15 +774,17 @@ and prints which untranslated functions stop them:
 NV_DATA="<...>/Fallout New Vegas/Data" cargo test -p engine --test real_scda -- --ignored --nocapture
 ```
 
-The executable is found next to `Data` (`exe::installed_exe`) and refused
-unless it is 1.4.0.525 (`exe::verify`), the check a game start-up can reuse.
+The executable is found next to `Data` (`exe::installed_exe`); `exe::verify`
+checks that it is a PE with the sections the translations read (the build is
+not checked).
 
 ## In the running game
 
 The `host` crate starts the engine for the running game. The viewer calls
 `host::Host::start(<Data>)` before loading anything: it opens the
-`FalloutNV.exe` next to `Data` (read-only), refuses every build but
-1.4.0.525 with the file and the reason, maps the data sections and runs the
+`FalloutNV.exe` next to `Data` (read-only), refuses a file that is not a PE
+or lacks a required section (naming the file and the reason), maps the data
+sections and runs the
 allocator start-up the probes run (`00401000`, `00aa2230`, `00aa21d0`,
 holder at `011f6118`, `00aa2020`: the body of `00866690`, which the memory
 manager's constructor runs in the game); after the static initializers it

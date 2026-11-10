@@ -347,13 +347,13 @@ impl FreshEngine {
         let file = fs::read(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
         let secs = engine::exe::checked_sections(exe, &file)?;
         let mut sections = Vec::new();
-        for (name, va, vsize, _) in engine::exe::SECTIONS {
+        for name in engine::exe::SECTIONS {
             let s = secs
                 .iter()
                 .find(|s| s.name == name)
                 .ok_or_else(|| format!("no {name} section"))?;
-            let n = s.raw.len().min(vsize as usize);
-            sections.push((va, vsize.max(s.raw.len() as u32), s.raw[..n].to_vec()));
+            let n = s.raw.len().min(s.vsize as usize);
+            sections.push((s.va, s.vsize.max(s.raw.len() as u32), s.raw[..n].to_vec()));
         }
         Ok(FreshEngine {
             sections,

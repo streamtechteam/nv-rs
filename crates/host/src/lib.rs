@@ -71,13 +71,13 @@ impl Drop for Host {
 impl Host {
     /// Starts the game's code for the installation whose `Data` folder is
     /// `data`: its `FalloutNV.exe` ([`engine::exe::installed_exe`]),
-    /// checked to be 1.4.0.525 ([`engine::exe::checked_sections`], the check
-    /// `engine::exe::verify` makes) and mapped; then the static initializers
+    /// checked for the data sections it needs ([`engine::exe::checked_sections`],
+    /// the check `engine::exe::verify` makes) and mapped; then the static initializers
     /// ([`engine::static_init::run`], in `__cinit`'s order, the untranslated
     /// ones skipped and counted), the memory manager's among them replaced by
     /// [`start_allocator`] ([`STAND_INS`]); then the game objects forms need
     /// when they are made ([`start_game_objects`]). The error says which file and why (missing,
-    /// not a PE file, another build).
+    /// not a PE file, a required section missing).
     pub fn start(data: &Path) -> Result<Host, String> {
         Host::start_with(data, &fixes::Choice::vanilla())
     }
@@ -88,8 +88,8 @@ impl Host {
         let exe = engine::exe::installed_exe(data);
         if !exe.is_file() {
             return Err(format!(
-                "{}: not found. nv-rs reads the game's own FalloutNV.exe (version \
-                 1.4.0.525) from the installation whose Data folder it is given.",
+                "{}: not found. nv-rs reads the game's own FalloutNV.exe from the \
+                 installation whose Data folder it is given.",
                 exe.display()
             ));
         }
